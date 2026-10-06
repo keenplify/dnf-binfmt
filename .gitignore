@@ -1,0 +1,4 @@
+/target/
+/build/
+*.rpm
+__pycache__/

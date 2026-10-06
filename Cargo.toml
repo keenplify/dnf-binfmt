@@ -1,0 +1,12 @@
+[package]
+name = "dnf-binfmt"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT"
+description = "Experimental DNF-managed x86-64 environments for Fedora Asahi and muvm/FEX"
+
+[profile.release]
+strip = true
+lto = true
+
