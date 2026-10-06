@@ -20,6 +20,7 @@ unsafe extern "C" {
 pub struct CommandSpec {
     pub program: String,
     pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
 }
 
 impl CommandSpec {
@@ -27,18 +28,29 @@ impl CommandSpec {
         Self {
             program: program.into(),
             args,
+            env: vec![],
         }
     }
     pub fn display(&self) -> String {
-        std::iter::once(&self.program)
+        let command = std::iter::once(&self.program)
             .chain(&self.args)
             .map(|a| shell_quote(a))
             .collect::<Vec<_>>()
-            .join(" ")
+            .join(" ");
+        if self.env.is_empty() {
+            command
+        } else {
+            let environment = self.env.iter()
+                .map(|(key, value)| shell_quote(&format!("{key}={value}")))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("env {environment} {command}")
+        }
     }
     pub fn process(&self) -> Command {
         let mut command = Command::new(&self.program);
         command.args(&self.args);
+        command.envs(self.env.iter().cloned());
         command
     }
     pub fn checked(&self) -> Result<()> {
@@ -162,7 +174,14 @@ pub fn image_command(root: &Path, image: &Path) -> CommandSpec {
 }
 
 pub fn launch_command(profile: &Profile, image: &Path, args: &[String]) -> CommandSpec {
-    let mut result = vec!["--emu=fex".into(), "-i".into(), "-f".into(), string(image)];
+    let mut result = vec![
+        "--emu=fex".into(),
+        "-i".into(),
+        "-e".into(),
+        "FEX_ROOTFS=/run/fex-emu/rootfs".into(),
+        "-f".into(),
+        string(image),
+    ];
     for overlay in &profile.overlays {
         result.extend(["-f".into(), string(overlay)]);
     }
@@ -597,6 +616,7 @@ pub fn execute(options: Options) -> Result<u8> {
             if std::env::consts::ARCH != "aarch64" {
                 return Err("muvm/FEX runtime requires an aarch64 host".into());
             }
+            runtime::prepare(&spec)?;
             Err(spec.process().exec().into())
         }
         "export" => {

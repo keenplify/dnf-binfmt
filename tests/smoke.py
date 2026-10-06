@@ -72,10 +72,13 @@ with tempfile.TemporaryDirectory(prefix="dnf-binfmt-smoke-") as temporary:
 
     launch = checked(dnf + ["run", f"--state-dir={state}", "--dry-run", "--", "/usr/bin/example", "--help", "literal $(touch nope)"], environment)
     assert "FEXBash" in launch and "literal $(touch nope)" in launch
+    assert "XDG_RUNTIME_DIR=" in launch and "/dnf-binfmt/" in launch
+    assert "FEX_ROOTFS=/run/fex-emu/rootfs" in launch
     assert "--help" in launch
     assert not Path("nope").exists()
     software = checked(dnf + ["run", f"--state-dir={state}", "--dry-run", "--graphics=software", "--session-bus=filtered", "--", "/usr/bin/example"], environment)
     assert "LIBGL_ALWAYS_SOFTWARE=1" in software and "session_bus.py" in software
+    assert "XDG_RUNTIME_DIR=" in software and "/dnf-binfmt/" in software
     update = checked(dnf + ["upgrade", f"--state-dir={state}", "--accept-no-scripts", "--dry-run"], environment)
     assert "--forcearch=aarch64" in update and "--arch=aarch64" in update
     assert image.read_bytes() == before

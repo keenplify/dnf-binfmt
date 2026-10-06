@@ -5,8 +5,53 @@ use crate::{
 };
 use std::{
     fs,
+    hash::{DefaultHasher, Hash, Hasher},
+    os::unix::fs::{DirBuilderExt, MetadataExt},
     path::{Path, PathBuf},
 };
+
+unsafe extern "C" {
+    fn geteuid() -> u32;
+}
+
+fn vm_directory(base: &Path, profile: &Profile, image: &Path) -> PathBuf {
+    let mut hash = DefaultHasher::new();
+    image.hash(&mut hash);
+    profile.overlays.hash(&mut hash);
+    // An overlay replaced in place must not reuse the previous VM either.
+    for overlay in &profile.overlays {
+        if let Ok(metadata) = fs::metadata(overlay) {
+            metadata.len().hash(&mut hash);
+            metadata.modified().ok().hash(&mut hash);
+        }
+    }
+    base.join("dnf-binfmt").join(format!("{:016x}", hash.finish()))
+}
+
+fn private_directory(path: &Path) -> Result<()> {
+    match fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
+        Err(error) => return Err(error.into()),
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.uid() != unsafe { geteuid() } || metadata.mode() & 0o077 != 0 {
+        return Err(format!(
+            "runtime directory must be a private directory owned by you: {}",
+            path.display()
+        ).into());
+    }
+    Ok(())
+}
+
+pub fn prepare(command: &CommandSpec) -> Result<()> {
+    let (_, directory) = command.env.iter()
+        .find(|(key, _)| key == "XDG_RUNTIME_DIR")
+        .ok_or("missing managed VM runtime directory")?;
+    let directory = Path::new(directory);
+    private_directory(directory.parent().ok_or("runtime directory has no parent")?)?;
+    private_directory(directory)
+}
 
 fn app_ids(root: &Path, executable: &str) -> Result<Vec<String>> {
     let directory = root.join("usr/share/applications");
@@ -118,6 +163,26 @@ pub fn plan(
         _ => capabilities.session_bus(),
     };
     let mut command = launch_command(profile, image, &options.args);
+    // muvm checks its runtime lock before processing -f. A shared runtime
+    // directory can silently send this command to a VM with a different image.
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe { geteuid() })));
+    if !base.is_absolute() {
+        return Err("XDG_RUNTIME_DIR must be an absolute path".into());
+    }
+    command.env.push((
+        "XDG_RUNTIME_DIR".into(),
+        vm_directory(&base, profile, image).to_string_lossy().into_owned(),
+    ));
+    // muvm uses the host runtime directory to discover the audio socket.
+    // Preserve that discovery when moving its lock and server sockets.
+    if std::env::var_os("PULSE_SERVER").is_none() && base.join("pulse/native").exists() {
+        command.env.push((
+            "PULSE_SERVER".into(),
+            format!("unix:{}", base.join("pulse/native").display()),
+        ));
+    }
     let mut environment = vec![];
     if capabilities.gui() || software {
         environment.extend(["GDK_BACKEND=x11", "NO_AT_BRIDGE=1", "GTK_MODULES="]);
@@ -149,12 +214,49 @@ pub fn plan(
     }
     args.extend(["--".into(), command.program]);
     args.extend(command.args);
-    Ok(CommandSpec::new("/usr/bin/python3", args))
+    let mut bridge = CommandSpec::new("/usr/bin/python3", args);
+    bridge.env = command.env;
+    Ok(bridge)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn vm_reuse_is_scoped_to_generation_and_overlay_order() {
+        let mut profile = Profile {
+            directory: "/var/lib/dnf-binfmt/default".into(),
+            releasever: "44".into(),
+            overlays: vec![],
+        };
+        let base = Path::new("/run/user/1000");
+        let image = Path::new("/var/lib/dnf-binfmt/default/generations/one/rootfs.erofs");
+        let first = vm_directory(base, &profile, image);
+        assert_ne!(first, base.to_path_buf());
+        assert_eq!(first, vm_directory(base, &profile, image));
+        assert_ne!(first, vm_directory(base, &profile, Path::new("/var/lib/dnf-binfmt/default/generations/two/rootfs.erofs")));
+        profile.overlays = vec!["/one.erofs".into(), "/two.erofs".into()];
+        let overlays = vm_directory(base, &profile, image);
+        assert_ne!(first, overlays);
+        profile.overlays.reverse();
+        assert_ne!(overlays, vm_directory(base, &profile, image));
+    }
+
+    #[test]
+    fn runtime_directory_rejects_symlinks_and_public_permissions() {
+        let root = std::env::temp_dir().join(format!("dnf-binfmt-vm-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let directory = root.join("vm");
+        private_directory(&directory).unwrap();
+        private_directory(&directory).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&directory, &link).unwrap();
+        assert!(private_directory(&link).is_err());
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(private_directory(&directory).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn global_gui_policy_enables_software_rendering_and_filtered_bridge() {
         let profile = Profile {
@@ -176,6 +278,7 @@ mod tests {
         assert_eq!(command.program, "/usr/bin/python3");
         assert!(command.args.contains(&"LIBGL_ALWAYS_SOFTWARE=1".into()));
         assert!(command.args.contains(&"LIBGL_DRI3_DISABLE=1".into()));
+        assert!(command.env.iter().any(|(key, value)| key == "XDG_RUNTIME_DIR" && value.contains("/dnf-binfmt/")));
         options.graphics = "accelerated".into();
         options.session_bus = "off".into();
         let command = plan(
@@ -186,6 +289,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(command.program, "/usr/bin/muvm");
+        assert!(command.env.iter().any(|(key, value)| key == "XDG_RUNTIME_DIR" && value.contains("/dnf-binfmt/")));
         assert!(!command.args.contains(&"LIBGL_ALWAYS_SOFTWARE=1".into()));
         assert!(command.args.contains(&"DBUS_SESSION_BUS_ADDRESS=".into()));
     }

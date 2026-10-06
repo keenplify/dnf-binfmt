@@ -168,6 +168,17 @@ managed rootfs through muvm's existing FEX integration; muvm configures its
 guest binfmt handlers. Explicit `FEXBash` launch lets commands resolve against
 the managed x86-64 rootfs even when the executable is absent on the ARM host.
 
+Each generation and overlay configuration uses a private muvm runtime directory
+under `$XDG_RUNTIME_DIR/dnf-binfmt/`. muvm otherwise reuses the user's existing
+VM before processing `-f`, which can silently select a different rootfs and
+report a managed executable as missing. The launcher also sets
+`FEX_ROOTFS=/run/fex-emu/rootfs` inside the VM so user FEX configuration cannot
+select an unrelated image. Host audio socket discovery is preserved.
+
+An installed guest command such as `/usr/bin/hello` is stored in the managed
+root, so invoking `/usr/bin/hello` directly on the ARM host can still report
+“No such file or directory”. Use `dnf binfmt run -- /usr/bin/hello`.
+
 ```text
 dnf binfmt install PACKAGE
   -> DNF5 command adapter

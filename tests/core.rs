@@ -93,6 +93,7 @@ fn launch_uses_full_image_and_explicit_overlay_order() {
         ["/managed.erofs", "/gpu-x86.erofs", "/gpu-i386.erofs"]
     );
     assert!(!command.args.iter().any(|a| a.contains("default.erofs")));
+    assert!(command.args.windows(2).any(|a| a == ["-e", "FEX_ROOTFS=/run/fex-emu/rootfs"]));
 }
 
 #[test]

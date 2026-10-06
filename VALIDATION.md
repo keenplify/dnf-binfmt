@@ -9,12 +9,13 @@ Passed:
 - C++20 plugin compilation with `-Wall -Wextra -Werror`.
 - `make install DESTDIR=<workspace-stage>` with the production backend path;
   backend, plugin, and license installed into the staging directory only.
-- 20 Rust tests: profile/path validation, package-option injection, literal
+- 22 Rust tests: profile/path validation, package-option injection, literal
   application arguments, private transaction roots, complete-image launching,
   overlay ordering, desktop entries, failed DNF/image staging, publication,
   retained old images, exclusive profile locking, ELF capability detection, guest symlink resolution,
   generic runtime policies, desktop bus identities, native-query isolation,
-  and RPM epoch/version/release comparisons.
+  RPM epoch/version/release comparisons, generation/overlay-specific VM reuse,
+  and private runtime directory permission/symlink checks.
 - Seven Python bridge tests, including fragmented authentication, nonce rejection,
   literal command arguments, exact identity filters, and a real GLib client
   through nonce TCP and xdg-dbus-proxy to an isolated D-Bus daemon.
@@ -43,9 +44,11 @@ host package state, and never performs a package installation or VM launch.
 The transaction-failure tests inject child-process failures; they do not
 simulate every RPM failure. Desktop-export checks run under a non-root user.
 
+A real privileged DNF transaction was successful in the supplied host log;
+it was not repeated in this workspace. The reported `hello` launch failed.
+
 Not yet verified:
 
-- A real privileged DNF transaction in the managed installroot.
 - Running the resulting image/application through muvm + FEX on Apple Silicon.
 - Generic graphical application launch, host keyring integration in muvm,
   GPU overlays/thunks, and runtime performance.
