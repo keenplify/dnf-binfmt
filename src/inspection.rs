@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Default, Debug)]
 pub struct Inspection {
     pub elf_count: usize,
+    pub desktop_gui: bool,
     pub needed: BTreeSet<String>,
     pub provided: BTreeSet<String>,
 }
@@ -23,7 +24,7 @@ impl Inspection {
             .collect()
     }
     pub fn gui(&self) -> bool {
-        self.needed.iter().any(|s| {
+        self.desktop_gui || self.needed.iter().any(|s| {
             s.starts_with("libgtk-")
                 || s.starts_with("libgdk-")
                 || s.starts_with("libQt5Gui.")
@@ -113,6 +114,7 @@ fn walk(path: &Path, inspection: &mut Inspection) -> Result<()> {
 pub fn tree(path: &Path) -> Result<Inspection> {
     let mut inspection = Inspection::default();
     walk(path, &mut inspection)?;
+    inspection.desktop_gui = crate::desktop::has_graphical_launcher(path)?;
     Ok(inspection)
 }
 
@@ -293,6 +295,9 @@ pub fn application(root: &Path, executable: &str) -> Result<Inspection> {
         return Ok(Inspection::default());
     };
     let mut inspection = tree(&path)?;
+    // Shell launchers/bootstrap RPMs do not contain the downloaded GUI ELF.
+    // A matching non-terminal desktop entry still identifies a GUI launch.
+    inspection.desktop_gui = crate::desktop::graphical_launcher(root, executable)?;
     // Bundled plugins may be dlopened, so also inspect an app's adjacent lib
     // directory. Do not scan every application in /usr/bin as one application.
     if let Some(parent) = path.parent() {

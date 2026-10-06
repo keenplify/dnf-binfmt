@@ -36,7 +36,7 @@ public:
         command->set_description("Manage the x86-64 muvm/FEX compatibility environment");
         using namespace libdnf5::cli::session;
         flags.push_back(std::make_unique<BoolOption>(*this, "dry-run", '\0', "Print the plan without changes", false));
-        flags.push_back(std::make_unique<BoolOption>(*this, "accept-no-scripts", '\0', "Accept skipped RPM scripts and triggers (experimental)", false));
+        flags.push_back(std::make_unique<BoolOption>(*this, "accept-no-scripts", '\0', "Compatibility option; RPM scripts and triggers are always skipped", false));
         for (const auto & name : {"profile", "state-dir", "releasever", "graphics", "session-bus"}) {
             auto * value = static_cast<libdnf5::OptionString *>(parser.add_init_value(std::make_unique<libdnf5::OptionString>("")));
             auto * arg = parser.add_new_named_arg(name);

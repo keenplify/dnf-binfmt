@@ -1,6 +1,6 @@
 # Validation
 
-Checked on 2026-10-06 in an aarch64 Fedora environment with 16,384-byte pages.
+Checked on 2026-10-07 in an aarch64 Fedora environment with 16,384-byte pages.
 DNF5 5.4.6.0 (plugin API 2.0), RPM 6.0.2, Rust/Cargo 1.98.1.
 
 Passed:
@@ -8,8 +8,9 @@ Passed:
 - Release build of the Rust backend.
 - C++20 plugin compilation with `-Wall -Wextra -Werror`.
 - `make install DESTDIR=<workspace-stage>` with the production backend path;
-  backend, plugin, and license installed into the staging directory only.
-- 22 Rust tests: profile/path validation, package-option injection, literal
+  backend, plugin, session bridge, native/guest compatibility helpers, and
+  license installed into the staging directory only.
+- 25 Rust tests: profile/path validation, package-option injection, literal
   application arguments, private transaction roots, complete-image launching,
   overlay ordering, desktop entries, failed DNF/image staging, publication,
   retained old images, exclusive profile locking, ELF capability detection, guest symlink resolution,
@@ -22,11 +23,12 @@ Passed:
 - Inspection of the supplied Ente Auth 4.4.25 RPM: 16 x86-64 ELF files,
   GUI/session-bus detection, and external SONAME requirements. No Ente-specific
   rules or application payload are included in this repository.
-- Clippy on all targets with warnings denied.
+- Earlier Clippy check on all targets with warnings denied; Clippy is unavailable
+  in the current toolchain, so it was not rerun for the latest changes.
 - Actual DNF5 plugin registration, subcommand help, and backend invocation.
 - `tests/smoke.py`: real DNF5 argument parsing, install/run/upgrade dry-run plans, generic software/filtered launch policy,
   local RPM inspection,
-  skipped-script acknowledgement, invalid-RPM rejection, real EROFS creation
+  transactions without skipped-script acknowledgement and legacy flag compatibility, invalid-RPM rejection, real EROFS creation
   with 4K blocks and LZ4, integrity/extraction checks, cache exclusion, actual
   desktop export and validation, stale-launcher cleanup, and isolation from
   other profiles.
@@ -45,17 +47,36 @@ The transaction-failure tests inject child-process failures; they do not
 simulate every RPM failure. Desktop-export checks run under a non-root user.
 
 A real privileged DNF transaction was successful in the supplied host log;
-it was not repeated in this workspace. The reported `hello` launch failed.
+it was not repeated in this workspace. Actual `hello` launches through the
+managed image succeeded outside the filesystem/process sandbox.
+
+The native mmap helper passed four regression tests. The guest x86 helper
+passed the same four tests under FEX 2604 in muvm: a reservation exceeding
+4 GiB with a low hint could be unmapped, fixed mappings retained their address,
+syscall errors preserved errno, and `mmap64` shared the compatibility entry
+point.
+
+Discord 1.0.160 completed updates, loaded its web UI, and reported
+`renderer-full-interactive` through the rebuilt backend, filtered session bridge,
+and Fedora's installed FEX 2604. The cold startup took about 213 seconds.
+It used software graphics, `--disable-gpu`, and `--no-sandbox`. Temporary
+read-only overlays supplied the missing X11 and Mesa runtime packages; the
+GUI transaction audit now installs those providers and the common GTK/GBM/audio
+ABI automatically. Network-service timeouts and restarts occurred during
+startup but recovered. An isolated official FEX 2609.1 test also loaded the
+Discord web UI. No newer emulator was installed on the host.
+Discord login, audio, video, and screen sharing have not been verified.
 
 Not yet verified:
 
-- Running the resulting image/application through muvm + FEX on Apple Silicon.
 - Generic graphical application launch, host keyring integration in muvm,
   GPU overlays/thunks, and runtime performance.
 - Full managed-root native update checks against live vendor repositories.
 - Vendor package setup and packages requiring installation scripts.
 
-This session has no `/dev/kvm`. `doctor` correctly reports that limitation.
-Development RPMs were downloaded and extracted into the workspace; no build
-dependencies or plugin were installed into the host. The local repository
+The restricted tool sandbox hides `/dev/kvm`; approved host-side commands can
+access it and were used for the live VM checks. Debugging and cross-assembler
+RPMs were downloaded and extracted into `/tmp`; no host package installation
+was performed by the agent. Installing the rebuilt backend/plugin still needs
+`sudo make install`. The local repository
 was initialized with `git init -b main`; no remote or initial commit was created.

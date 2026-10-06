@@ -1,4 +1,7 @@
-use crate::{environment::Profile, Options, Result};
+use crate::{
+    environment::{CommandSpec, Profile},
+    Options, Result,
+};
 use std::{
     collections::HashSet,
     fs,
@@ -78,6 +81,111 @@ pub fn rewrite(content: &str, backend: &Path, state: &Path, profile: &str) -> Op
     Some(format!("{}\n", lines.join("\n")))
 }
 
+pub fn graphical_launcher(root: &Path, executable: &str) -> Result<bool> {
+    graphical_launchers(root, Some(executable))
+}
+
+pub fn has_graphical_launcher(root: &Path) -> Result<bool> {
+    graphical_launchers(root, None)
+}
+
+fn graphical_launchers(root: &Path, executable: Option<&str>) -> Result<bool> {
+    let directory = root.join("usr/share/applications");
+    if !directory.is_dir() {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() || entry.path().extension().is_none_or(|ext| ext != "desktop") {
+            continue;
+        }
+        let content = fs::read_to_string(entry.path())?;
+        let section = content.split("[Desktop Entry]").nth(1)
+            .map(|text| text.split('[').next().unwrap_or(text)).unwrap_or("");
+        if section.lines().any(|line| line == "Terminal=true") {
+            continue;
+        }
+        for line in section.lines() {
+            if let Some(exec) = line.strip_prefix("Exec=") {
+                let first = exec.split_whitespace().next().unwrap_or("").trim_matches('"');
+                if !first.is_empty() && executable.is_none_or(|executable| {
+                    first == executable || (!executable.contains('/')
+                        && Path::new(first).file_name().is_some_and(|name| name == executable))
+                }) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+// Resolve the sudo caller through the account database; never write user files
+// as root or use root's HOME/XDG_DATA_HOME for automatic exports.
+fn caller_export_command(
+    options: &Options,
+    uid: u32,
+    passwd: &str,
+    backend: &Path,
+) -> Result<CommandSpec> {
+    if uid == 0 {
+        return Err("no non-root sudo caller".into());
+    }
+    let fields: Vec<_> = passwd.trim_end().split(':').collect();
+    if fields.len() != 7
+        || fields[2].parse::<u32>()? != uid
+        || fields[0].is_empty()
+        || fields[0].starts_with('-')
+        || !Path::new(fields[5]).is_absolute()
+        || fields[5] == "/"
+    {
+        return Err("invalid sudo caller account".into());
+    }
+    let mut command = CommandSpec::new("/usr/bin/runuser", vec![
+        "--user".into(), fields[0].into(), "--".into(),
+        backend.to_string_lossy().into_owned(), "export".into(),
+        "--state-dir".into(), options.state_dir.to_string_lossy().into_owned(),
+        "--profile".into(), options.profile.clone(),
+    ]);
+    command.env = vec![
+        ("HOME".into(), fields[5].into()),
+        ("USER".into(), fields[0].into()),
+        ("LOGNAME".into(), fields[0].into()),
+        ("PATH".into(), "/usr/bin:/bin".into()),
+    ];
+    Ok(command)
+}
+
+pub fn export_after_transaction(options: &Options) -> Result<()> {
+    let uid: u32 = std::env::var("SUDO_UID")
+        .map_err(|_| "no sudo caller; run dnf binfmt export as your desktop user")?
+        .parse()?;
+    if uid == 0 {
+        return Err("no non-root sudo caller; run dnf binfmt export as your desktop user".into());
+    }
+    let account = std::process::Command::new("/usr/bin/getent")
+        .args(["passwd", &uid.to_string()])
+        .output()?;
+    if !account.status.success() {
+        return Err("could not resolve the sudo caller account".into());
+    }
+    let command = caller_export_command(
+        options,
+        uid,
+        &String::from_utf8(account.stdout)?,
+        &std::env::current_exe()?,
+    )?;
+    eprintln!("+ {}", command.display());
+    let status = command.process()
+        .env_clear()
+        .envs(command.env.iter().cloned())
+        .status()?;
+    if !status.success() {
+        return Err(format!("shortcut export exited with {status}").into());
+    }
+    Ok(())
+}
+
 pub fn export(options: &Options, profile: &Profile) -> Result<()> {
     let current = profile.current()?;
     let source = current.join("root/usr/share/applications");
@@ -148,6 +256,34 @@ pub fn export(options: &Options, profile: &Profile) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_entries_identify_gui_shell_launchers_without_matching_other_apps() {
+        let root = std::env::temp_dir().join(format!("dnf-binfmt-gui-desktop-{}", std::process::id()));
+        let source = root.join("usr/share/applications");
+        fs::create_dir_all(&source).unwrap();
+        let file = source.join("bootstrap.desktop");
+        fs::write(&file, "[Desktop Entry]\nType=Application\nExec=/usr/bin/bootstrap %U\n").unwrap();
+        assert!(graphical_launcher(&root, "/usr/bin/bootstrap").unwrap());
+        assert!(graphical_launcher(&root, "bootstrap").unwrap());
+        assert!(!graphical_launcher(&root, "/usr/bin/other").unwrap());
+        fs::write(file, "[Desktop Entry]\nTerminal=true\nExec=/usr/bin/bootstrap\n").unwrap();
+        assert!(!graphical_launcher(&root, "/usr/bin/bootstrap").unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn automatic_export_uses_sudo_account_and_current_profile() {
+        let options = Options::parse(vec!["install".into(), "--profile".into(), "tools".into(), "app".into()]).unwrap();
+        let command = caller_export_command(&options, 1000, "alice:x:1000:1000:Alice:/home/alice:/bin/bash\n", Path::new("/usr/libexec/dnf-binfmt")).unwrap();
+        assert_eq!(command.program, "/usr/bin/runuser");
+        assert_eq!(command.args, ["--user", "alice", "--", "/usr/libexec/dnf-binfmt", "export", "--state-dir", "/var/lib/dnf-binfmt", "--profile", "tools"]);
+        assert!(command.env.contains(&("HOME".into(), "/home/alice".into())));
+        assert!(!command.env.iter().any(|(name, _)| name == "XDG_DATA_HOME"));
+        for (uid, account) in [(0, "root:x:0:0:root:/root:/bin/bash"), (1000, "bob:x:1001:1001:Bob:/home/bob:/bin/bash"), (1000, "alice:x:1000:1000:Alice:/:/bin/bash")] {
+            assert!(caller_export_command(&options, uid, account, Path::new("/backend")).is_err());
+        }
+    }
 
     #[test]
     fn launchers_preserve_file_codes_and_disable_host_activation() {

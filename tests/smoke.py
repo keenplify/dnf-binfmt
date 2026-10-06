@@ -64,11 +64,14 @@ with tempfile.TemporaryDirectory(prefix="dnf-binfmt-smoke-") as temporary:
     assert not (extracted / "var/cache/secret").exists()
 
     before = image.read_bytes()
-    plan = checked(dnf + ["install", f"--state-dir={state}", "--accept-no-scripts", "--dry-run", "hello.x86_64"], environment)
+    plan = checked(dnf + ["install", f"--state-dir={state}", "--dry-run", "hello.x86_64"], environment)
     assert "--forcearch=x86_64" in plan and "--installroot=" in plan
     assert "noscripts,notriggers,noplugins" in plan
     assert image.read_bytes() == before
-    assert "explicitly pass --accept-no-scripts" in checked(dnf + ["install", f"--state-dir={state}", "hello"], environment, expect=1)
+    legacy_plan = checked(dnf + ["install", f"--state-dir={state}", "--accept-no-scripts", "--dry-run", "hello.x86_64"], environment)
+    assert legacy_plan == plan
+    removal = checked(dnf + ["remove", f"--state-dir={state}", "--dry-run", "hello.x86_64"], environment)
+    assert "noscripts,notriggers,noplugins" in removal
 
     launch = checked(dnf + ["run", f"--state-dir={state}", "--dry-run", "--", "/usr/bin/example", "--help", "literal $(touch nope)"], environment)
     assert "FEXBash" in launch and "literal $(touch nope)" in launch
@@ -79,7 +82,7 @@ with tempfile.TemporaryDirectory(prefix="dnf-binfmt-smoke-") as temporary:
     software = checked(dnf + ["run", f"--state-dir={state}", "--dry-run", "--graphics=software", "--session-bus=filtered", "--", "/usr/bin/example"], environment)
     assert "LIBGL_ALWAYS_SOFTWARE=1" in software and "session_bus.py" in software
     assert "XDG_RUNTIME_DIR=" in software and "/dnf-binfmt/" in software
-    update = checked(dnf + ["upgrade", f"--state-dir={state}", "--accept-no-scripts", "--dry-run"], environment)
+    update = checked(dnf + ["upgrade", f"--state-dir={state}", "--dry-run"], environment)
     assert "--forcearch=aarch64" in update and "--arch=aarch64" in update
     assert image.read_bytes() == before
 
@@ -89,7 +92,7 @@ with tempfile.TemporaryDirectory(prefix="dnf-binfmt-smoke-") as temporary:
 
     bad_rpm = scratch / "invalid.x86_64.rpm"
     bad_rpm.write_text("This is not an RPM.")
-    output = checked([str(backend), "install", "--state-dir", str(state), "--accept-no-scripts", "--dry-run", str(bad_rpm)], environment, expect=1)
+    output = checked([str(backend), "install", "--state-dir", str(state), "--dry-run", str(bad_rpm)], environment, expect=1)
     assert "not an x86_64/noarch RPM" in output
 
     if os.geteuid() != 0:

@@ -3,7 +3,7 @@ use crate::{
     desktop, inspection, native, runtime, Result,
 };
 use std::fs::{self, File, OpenOptions};
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::os::unix::{
     fs::{symlink, MetadataExt, PermissionsExt},
     process::CommandExt,
@@ -331,7 +331,7 @@ fn init(options: &Options) -> Result<u8> {
     }
     result?;
     println!(
-        "Initialized {}. Next: sudo dnf binfmt install --accept-no-scripts PACKAGE",
+        "Initialized {}. Next: sudo dnf binfmt install PACKAGE",
         options.profile
     );
     Ok(0)
@@ -364,9 +364,6 @@ fn package_args(options: &Options) -> Result<Vec<String>> {
 }
 
 fn mutate(options: &Options, profile: &Profile) -> Result<u8> {
-    if !options.accept_no_scripts {
-        return Err("experimental mode skips ALL RPM scripts and triggers; explicitly pass --accept-no-scripts to proceed".into());
-    }
     let packages = package_args(options)?;
     let previous = if profile.directory.join("current").exists() {
         Some(profile.current()?)
@@ -437,7 +434,12 @@ fn mutate(options: &Options, profile: &Profile) -> Result<u8> {
     let id = stage_generation(profile, &options.command, &requested, |command| {
         command.checked()
     })?;
-    println!("Published generation {id}. Run dnf binfmt export as your normal user to refresh menu entries.");
+    println!("Published generation {id}.");
+    // Package publication succeeded. An export failure must not report the
+    // installation as failed or roll back the published generation.
+    if let Err(error) = desktop::export_after_transaction(options) {
+        eprintln!("Packages updated, but menu entries were not refreshed: {error}. Run dnf binfmt export as your normal user.");
+    }
     Ok(0)
 }
 
@@ -483,7 +485,24 @@ fn stage_generation(
         // newly found providers may introduce another library, so repeat with
         // a bound. Unresolved providers abort publication, preserving current.
         for pass in 0..4 {
-            let missing = inspection::tree(&root)?.missing();
+            let mut capabilities = inspection::tree(&root)?;
+            if capabilities.gui() {
+                // Chromium and other X11 clients dlopen this library; it is
+                // absent from ELF DT_NEEDED and bootstrap RPM dependencies.
+                capabilities.needed.insert("libX11-xcb.so.1".into());
+                // Weak dependencies are disabled. Mesa loads its software
+                // driver and GBM backend dynamically, so ELF auditing alone
+                // misses the modules required by the default graphics mode.
+                capabilities.needed.extend([
+                    "libEGL_mesa.so.0".into(), "libGLX_mesa.so.0".into(),
+                    // A desktop bootstrapper can download its real payload
+                    // outside the RPM root. Provide the common desktop ABI
+                    // there too, instead of relying on the ARM host's GTK.
+                    "libgtk-3.so.0".into(), "libgbm.so.1".into(),
+                    "libpulse.so.0".into(),
+                ]);
+            }
+            let missing = capabilities.missing();
             if missing.is_empty() {
                 break;
             }
@@ -492,6 +511,10 @@ fn stage_generation(
             }
             eprintln!("Resolving {} missing ELF library providers", missing.len());
             run(dnf_command(profile, &root, "install", &missing))?;
+        }
+        if inspection::tree(&root)?.gui()
+            && !root.join("usr/lib64/gbm/dri_gbm.so").exists() {
+            run(dnf_command(profile, &root, "install", &["mesa-dri-drivers.x86_64".into()]))?;
         }
         if !root.join("usr/bin/bash").is_file() {
             return Err("transaction left no x86-64 bash; refusing publication".into());
@@ -602,10 +625,7 @@ pub fn execute(options: Options) -> Result<u8> {
                 }
             }
             let capabilities = inspection::application(&current.join("root"), &options.args[0])?;
-            let mut spec = runtime::plan(&profile, &image, &options, &capabilities)?;
-            if std::io::stdin().is_terminal() && spec.program == "/usr/bin/muvm" {
-                spec.args.insert(0, "-t".into());
-            }
+            let spec = runtime::plan(&profile, &image, &options, &capabilities)?;
             if options.dry_run {
                 println!("{}", spec.display());
                 return Ok(0);
@@ -615,6 +635,9 @@ pub fn execute(options: Options) -> Result<u8> {
             }
             if std::env::consts::ARCH != "aarch64" {
                 return Err("muvm/FEX runtime requires an aarch64 host".into());
+            }
+            if let Err(error) = runtime::prepare_video_bridge(&options, &capabilities) {
+                eprintln!("Could not start host XWayland Video Bridge: {error}");
             }
             runtime::prepare(&spec)?;
             Err(spec.process().exec().into())

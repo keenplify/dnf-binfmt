@@ -21,7 +21,7 @@ Options:
   --state-dir PATH        Absolute state directory (default: /var/lib/dnf-binfmt)
   --releasever NUMBER     Fedora release for init, e.g. 44
   --overlay PATH          Extra EROFS image for init; repeatable (e.g. GPU libraries)
-  --accept-no-scripts     Accept skipped RPM scripts/triggers; required for mutations
+  --accept-no-scripts     Compatibility option; scripts/triggers are always skipped
   --dry-run               Print commands without executing or writing files
   --graphics MODE         Run: auto, software, accelerated (default: auto)
   --session-bus MODE      Run: auto, filtered, off (default: auto)

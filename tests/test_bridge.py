@@ -59,6 +59,8 @@ class AuthenticationTests(unittest.TestCase):
         self.assertTrue(bridge.valid_identity("io.example.Auth"))
         for identity in ["*", "org.kde.*", "--talk=*", "io..app", "io.1app"]:
             self.assertFalse(bridge.valid_identity(identity))
+            with self.assertRaises(ValueError):
+                bridge.proxy_command("unix:path=/unused", "/unused", [identity])
 
 
 class RealGLibBridgeTest(unittest.TestCase):
@@ -84,7 +86,7 @@ class RealGLibBridgeTest(unittest.TestCase):
                         break
                     time.sleep(0.01)
                 self.assertTrue(host_socket.exists())
-                proxy = subprocess.Popen(["/usr/bin/xdg-dbus-proxy", f"unix:path={host_socket}", str(proxy_socket), "--filter", "--talk=org.freedesktop.secrets"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                proxy = subprocess.Popen(bridge.proxy_command(f"unix:path={host_socket}", proxy_socket, ["io.example.App"]), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 for _ in range(100):
                     if proxy_socket.exists():
                         break

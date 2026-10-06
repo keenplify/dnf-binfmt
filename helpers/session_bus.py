@@ -26,7 +26,6 @@ TALK = (
     "org.freedesktop.Notifications",
     "org.freedesktop.portal.Desktop",
 )
-OWN = ("org.kde.StatusNotifierItem-*",)
 MAX_AUTH = 32768
 
 
@@ -124,6 +123,17 @@ exec "$@"
     return command[:boundary + 1] + ["/usr/bin/bash", "-c", script, "dnf-binfmt", str(port), quote(str(nonce_file), safe="/")] + command[boundary + 1:]
 
 
+def proxy_command(address, proxy_socket, identities):
+    # xdg-dbus-proxy accepts exact names and namespace wildcards ("name.*"),
+    # not partial-component globs such as "StatusNotifierItem-*". Restrict
+    # ownership to the application's explicit desktop identities.
+    if any(not valid_identity(name) for name in identities):
+        raise ValueError("invalid application bus identity")
+    return (["/usr/bin/xdg-dbus-proxy", address, str(proxy_socket), "--filter"]
+            + [f"--talk={name}" for name in TALK]
+            + [f"--own={name}" for name in identities])
+
+
 def main(args):
     identities = []
     while args[:1] == ["--app-id"]:
@@ -152,10 +162,7 @@ def main(args):
         with os.fdopen(descriptor, "wb") as file:
             file.write(nonce)
         proxy_socket = folder / "bus"
-        proxy_args = ["/usr/bin/xdg-dbus-proxy", address, str(proxy_socket), "--filter"]
-        proxy_args += [f"--talk={name}" for name in TALK]
-        proxy_args += [f"--own={name}" for name in OWN]
-        proxy_args += [f"--own={name}" for name in identities]
+        proxy_args = proxy_command(address, proxy_socket, identities)
         proxy = subprocess.Popen(proxy_args)
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         stopped = threading.Event()

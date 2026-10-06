@@ -6,7 +6,7 @@ launching them through **muvm + FEXBash**.
 
 ```sh
 sudo dnf binfmt init --releasever 44
-sudo dnf binfmt install --accept-no-scripts hello.x86_64
+sudo dnf binfmt install hello.x86_64
 dnf binfmt run -- /usr/bin/hello
 ```
 
@@ -22,11 +22,14 @@ This is a first prototype, **not a production compatibility layer**. Rust and
 the DNF5 adapter compile, and the plugin command is exercised with the real
 DNF5 parser. Tests check argument isolation and launch/image planning.
 Failure tests check that unsuccessful staging preserves the active generation.
-Full DNF installation and application execution on Apple Silicon still need
-validation. See [VALIDATION.md](VALIDATION.md) for the exact checks performed.
+The managed image runs `hello` through muvm/FEX on Apple Silicon. Discord reached its fully interactive web UI
+with the compatibility helper; login, audio, and screen sharing still need
+validation. See [VALIDATION.md](VALIDATION.md).
 
 **All RPM scripts and triggers are skipped**, including dependency scripts.
-Every install, upgrade, and removal therefore requires `--accept-no-scripts`.
+Install, upgrade, and removal proceed without an acknowledgement flag and
+print a notice when running the transaction. `--accept-no-scripts` is still
+accepted for compatibility with existing commands.
 Apps relying on setup scripts, caches, services, kernel modules, or host
 integration may fail. Implementing scripts inside an emulated writable root
 is the main next step. Running them on the ARM host would not fix this.
@@ -40,13 +43,14 @@ work. Per-user application settings can use the user's home directory.
 ## Build and install
 
 Requirements: Fedora's Rust/Cargo (Rust 1.89+), C++20 compiler, Make,
-`dnf5-devel`, `libdnf5-devel`, `libdnf5-cli-devel`, and `fmt-devel`.
+`dnf5-devel`, `libdnf5-devel`, `libdnf5-cli-devel`, `fmt-devel`, `erofs-utils`,
+and `binutils-x86_64-linux-gnu` on ARM (for the small guest runtime helper).
 The adapter targets DNF5 plugin API 2.0 and libdnf5-cli ABI 3.
 
 ```sh
-sudo dnf install rust cargo gcc-c++ make dnf5-devel libdnf5-devel libdnf5-cli-devel fmt-devel
-cargo test --offline
+sudo dnf install rust cargo gcc-c++ make dnf5-devel libdnf5-devel libdnf5-cli-devel fmt-devel erofs-utils binutils-x86_64-linux-gnu
 make
+make test
 sudo make install
 sudo dnf install binfmt-dispatcher fex-emu muvm erofs-utils binutils rpm-build python3 xdg-dbus-proxy
 dnf binfmt doctor
@@ -67,29 +71,34 @@ Initialize the managed environment once, then use package names or local RPMs:
 
 ```sh
 sudo dnf binfmt init --releasever 44
-sudo dnf binfmt install --accept-no-scripts hello.x86_64
-sudo dnf binfmt install --accept-no-scripts ./application.x86_64.rpm
+sudo dnf binfmt install hello.x86_64
+sudo dnf binfmt install ./application.x86_64.rpm
 dnf binfmt list
 dnf binfmt run -- /usr/bin/hello
 dnf binfmt export
-sudo dnf binfmt upgrade --accept-no-scripts
-sudo dnf binfmt remove --accept-no-scripts hello
+sudo dnf binfmt upgrade
+sudo dnf binfmt remove hello
 dnf binfmt export
 ```
 
-Run applications and `export` as your desktop user. Export discovers normal
+Run applications and manual `export` as your desktop user. Successful installs,
+upgrades, and removals through sudo automatically refresh menu entries for
+the invoking user, dropping root privileges before writing shortcuts. Direct
+root sessions need a manual `dnf binfmt export` from the desktop user.
+Export discovers normal
 `.desktop` files in the environment's `/usr/share/applications`, rewrites
 their launch commands, preserves file/URL field codes and desktop actions,
 and removes stale launchers belonging to that profile. D-Bus activation and
 host `TryExec`/working-directory checks are disabled. Icons and requested
-working directories are not integrated yet. Refresh exports after package
-changes; exporting is not automatically performed by root installations.
+working directories are not integrated yet. Automatic exports use the sudo caller's standard `~/.local/share/applications`
+directory. For a custom `XDG_DATA_HOME`, run `dnf binfmt export` manually
+in your desktop session.
 
 Use `--profile NAME` after a subcommand to manage additional environments:
 
 ```sh
 sudo dnf binfmt init --profile tools --releasever 44
-sudo dnf binfmt install --profile tools --accept-no-scripts hello.x86_64
+sudo dnf binfmt install --profile tools hello.x86_64
 dnf binfmt run --profile tools -- /usr/bin/hello --help
 ```
 
@@ -99,7 +108,7 @@ require an initialized profile except for `init --dry-run`, `inspect`, and `doct
 
 ```sh
 dnf binfmt init --releasever 44 --dry-run
-dnf binfmt install --accept-no-scripts --dry-run hello.x86_64
+dnf binfmt install --dry-run hello.x86_64
 dnf binfmt run --dry-run -- /usr/bin/hello
 ```
 
@@ -120,16 +129,43 @@ root and resolves missing providers before publishing the image. Bundled
 libraries are taken into account. This supplements RPM dependency metadata;
 optional ELF plugins can pull in unnecessary libraries, and libraries loaded
 only by name through `dlopen` cannot all be discovered this way.
+GUI environments also install the provider of `libX11-xcb.so.1`, which newer
+Chromium clients load by name, and Mesa EGL/GLX and software DRI drivers.
+The common GUI runtime also includes GTK3, GBM, and PulseAudio libraries for
+bootstrap RPMs whose actual payload is downloaded into the user's home.
+These modules cannot be discovered reliably through ELF dependencies alone.
+Software mode explicitly selects `swrast` and `llvmpipe` instead of inheriting
+muvm's Asahi driver override.
+
+GUI launches include a small compatibility overlay and native/guest mmap
+helpers. FEX 2604 can accept a low-address mapping that crosses 4 GiB, then
+reject its cleanup with `EOVERFLOW`; V8 traps on that failed cleanup. The helper
+discards only non-fixed hints crossing that boundary, allowing a normal high
+address. Fixed mappings keep their semantics. It does not disable application
+sandboxes. With this FEX version, Discord additionally needs explicit
+`--no-sandbox` to run its renderer:
+
+```sh
+dnf binfmt run --graphics software --session-bus filtered -- /usr/bin/discord --disable-gpu --no-sandbox
+```
 
 GTK, Qt GUI, and Flutter GTK applications default to software rendering and X11
-settings to avoid the observed accelerated-rendering failure. Applications
+settings to avoid the observed accelerated-rendering failure. Software mode
+also selects muvm's `--gpu-mode=software` rather than its default DRM GPU. Applications
 using GUI/session-bus libraries get a per-launch filtered bridge. It allows
 Secret Service, tray registration, notifications, and desktop portals. Exact
-application bus identities are inferred from matching desktop entries, with a
-narrow tray-item ownership rule. Arbitrary host bus services remain inaccessible.
+application bus identities are inferred from matching desktop entries, without wildcard ownership rules. Arbitrary host bus services remain inaccessible.
 The bridge authenticates with a private nonce and adapts GLib authentication to
 a filtered host connection. The small bridge helper uses Python's standard
 library and `xdg-dbus-proxy`; package management and policy remain Rust.
+
+GUI shell launchers are detected through their matching desktop entries.
+On Wayland, GUI launches also start the host's `xwaylandvideobridge` when
+installed, reusing an existing instance. It runs in the original host desktop
+session and supports sharing Wayland windows with X11 apps through the screen
+selection portal. muvm handles displaying the app's X11 windows. Install the
+video bridge on the ARM host with `sudo dnf install xwaylandvideobridge`.
+Bridge startup logs are in `$XDG_RUNTIME_DIR/dnf-binfmt/video-bridge-*.log`.
 
 Overrides are available for applications whose capabilities cannot be detected:
 
@@ -168,7 +204,7 @@ managed rootfs through muvm's existing FEX integration; muvm configures its
 guest binfmt handlers. Explicit `FEXBash` launch lets commands resolve against
 the managed x86-64 rootfs even when the executable is absent on the ARM host.
 
-Each generation and overlay configuration uses a private muvm runtime directory
+Each generation, overlay configuration, and GPU mode uses a private muvm runtime directory
 under `$XDG_RUNTIME_DIR/dnf-binfmt/`. muvm otherwise reuses the user's existing
 VM before processing `-f`, which can silently select a different rootfs and
 report a managed executable as missing. The launcher also sets
@@ -220,6 +256,37 @@ DNF resolves dependencies using its own database in the managed root; it does
 not assume the host's libraries or shared FEX rootfs satisfy those dependencies.
 The default repository set excludes Asahi-only and host third-party repos.
 Add vendor repositories/signing keys to a profile as an administrator if needed.
+
+For RPM Fusion packages, enable the stable Free and Nonfree repositories in
+that profile explicitly (run from this repository):
+
+```sh
+sudo install -m644 examples/rpmfusion.repo /var/lib/dnf-binfmt/default/repos.d/rpmfusion.repo
+sudo dnf binfmt install discord
+```
+
+Use your profile's directory if it is not `default`. The example uses the
+profile's pinned `$releasever` and the transaction's `$basearch`, and retains
+package signature verification with keys from RPM Fusion's official source.
+It does not enable testing, rawhide, or host repositories. Installing a vendor
+release RPM in the managed root does not configure the profile's `repos.d`;
+repository definitions must be placed there separately. RPM URLs must be
+downloaded before using `dnf binfmt install`.
+
+Some vendor RPMs install a bootstrapper that downloads the actual application
+into the user's home directory on first launch. Those downloaded binaries
+are outside the RPM dependency and installation-time ELF checks. For example,
+if Discord reports missing ATK/GTK libraries, install its desktop runtime
+libraries into the managed profile:
+
+```sh
+sudo dnf binfmt install gtk3 mesa-libgbm pulseaudio-libs
+```
+
+Then launch it again as your normal user. The first Discord start under FEX
+can take several minutes while its updater and renderer initialize. Installing these libraries on the
+ARM host does not supply the x86-64 libraries in the managed image.
+
 Local RPM signatures are checked too; unsigned local RPMs are not accepted by
 the default configuration. Import required vendor keys into the managed RPM
 database/configuration before installing their packages.

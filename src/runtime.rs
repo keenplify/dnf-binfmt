@@ -6,7 +6,11 @@ use crate::{
 use std::{
     fs,
     hash::{DefaultHasher, Hash, Hasher},
-    os::unix::fs::{DirBuilderExt, MetadataExt},
+    io::IsTerminal,
+    os::unix::{
+        fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+        process::CommandExt,
+    },
     path::{Path, PathBuf},
 };
 
@@ -14,9 +18,10 @@ unsafe extern "C" {
     fn geteuid() -> u32;
 }
 
-fn vm_directory(base: &Path, profile: &Profile, image: &Path) -> PathBuf {
+fn vm_directory(base: &Path, profile: &Profile, image: &Path, software: bool) -> PathBuf {
     let mut hash = DefaultHasher::new();
     image.hash(&mut hash);
+    software.hash(&mut hash);
     profile.overlays.hash(&mut hash);
     // An overlay replaced in place must not reuse the previous VM either.
     for overlay in &profile.overlays {
@@ -51,6 +56,61 @@ pub fn prepare(command: &CommandSpec) -> Result<()> {
     let directory = Path::new(directory);
     private_directory(directory.parent().ok_or("runtime directory has no parent")?)?;
     private_directory(directory)
+}
+
+fn video_bridge_running(proc_root: &Path) -> bool {
+    let Ok(processes) = fs::read_dir(proc_root) else { return false; };
+    processes.flatten().any(|entry| {
+        entry.file_name().to_string_lossy().bytes().all(|c| c.is_ascii_digit())
+            && entry.metadata().is_ok_and(|meta| meta.uid() == unsafe { geteuid() })
+            && fs::read_link(entry.path().join("exe")).is_ok_and(|exe| {
+                exe.file_name().is_some_and(|name| name == "xwaylandvideobridge")
+            })
+    })
+}
+
+pub fn prepare_video_bridge(options: &Options, capabilities: &Inspection) -> Result<()> {
+    let gui = capabilities.gui() || options.graphics != "auto";
+    let wayland = std::env::var("XDG_SESSION_TYPE").is_ok_and(|value| value == "wayland")
+        || std::env::var_os("WAYLAND_DISPLAY").is_some();
+    if !gui || !wayland {
+        return Ok(());
+    }
+    if std::env::var_os("DISPLAY").is_none_or(|value| value.is_empty()) {
+        eprintln!("XWayland Video Bridge needs the host XWayland DISPLAY; launch from your desktop session.");
+        return Ok(());
+    }
+    let executable = Path::new("/usr/bin/xwaylandvideobridge");
+    if !executable.is_file() {
+        eprintln!("For Wayland screen sharing, install xwaylandvideobridge on the host: sudo dnf install xwaylandvideobridge");
+        return Ok(());
+    }
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe { geteuid() })));
+    if !base.is_absolute() {
+        return Err("XDG_RUNTIME_DIR must be an absolute path".into());
+    }
+    let directory = base.join("dnf-binfmt");
+    private_directory(&directory)?;
+    let lock = fs::OpenOptions::new().write(true).create(true).truncate(false)
+        .mode(0o600).open(directory.join("video-bridge.lock"))?;
+    // Other launches need not wait for this optional host helper.
+    if lock.try_lock().is_err() || video_bridge_running(Path::new("/proc")) {
+        return Ok(());
+    }
+    let log = directory.join(format!("video-bridge-{}.log", std::process::id()));
+    let output = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&log)?;
+    // Inherit the original host Wayland/session environment, before muvm's
+    // XDG_RUNTIME_DIR is applied. Detach stdio so a tee pipeline can finish.
+    std::process::Command::new(executable)
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(output)
+        .spawn()?;
+    eprintln!("Started host XWayland Video Bridge for screen sharing (log: {}).", log.display());
+    Ok(())
 }
 
 fn app_ids(root: &Path, executable: &str) -> Result<Vec<String>> {
@@ -146,6 +206,23 @@ fn bridge_helper() -> Result<PathBuf> {
     Err("session-bus helper is missing; reinstall dnf-binfmt or use --session-bus off".into())
 }
 
+fn compatibility_assets() -> Result<PathBuf> {
+    let executable = std::env::current_exe()?;
+    let installed = executable.parent().ok_or("backend has no parent")?
+        .join("dnf-binfmt-runtime");
+    let development = executable.ancestors()
+        .find(|path| path.file_name().is_some_and(|name| name == "target"))
+        .and_then(Path::parent)
+        .map(|root| root.join("build/runtime"));
+    for directory in std::iter::once(installed).chain(development) {
+        if directory.join("native/dnf-binfmt-mmap.so").is_file()
+            && directory.join("rootfs.erofs").is_file() {
+            return Ok(directory);
+        }
+    }
+    Err("FEX compatibility helper is missing; run make and sudo make install".into())
+}
+
 pub fn plan(
     profile: &Profile,
     image: &Path,
@@ -162,7 +239,25 @@ pub fn plan(
         "off" => false,
         _ => capabilities.session_bus(),
     };
-    let mut command = launch_command(profile, image, &options.args);
+    let assets = if capabilities.gui() || software {
+        Some(compatibility_assets()?)
+    } else {
+        None
+    };
+    let runtime_profile = Profile {
+        directory: profile.directory.clone(),
+        releasever: profile.releasever.clone(),
+        overlays: profile.overlays.iter().cloned()
+            .chain(assets.iter().map(|directory| directory.join("rootfs.erofs")))
+            .collect(),
+    };
+    let mut command = launch_command(&runtime_profile, image, &options.args);
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        command.args.insert(0, "-t".into());
+    }
+    if software {
+        command.args.insert(0, "--gpu-mode=software".into());
+    }
     // muvm checks its runtime lock before processing -f. A shared runtime
     // directory can silently send this command to a VM with a different image.
     let base = std::env::var_os("XDG_RUNTIME_DIR")
@@ -173,7 +268,7 @@ pub fn plan(
     }
     command.env.push((
         "XDG_RUNTIME_DIR".into(),
-        vm_directory(&base, profile, image).to_string_lossy().into_owned(),
+        vm_directory(&base, &runtime_profile, image, software).to_string_lossy().into_owned(),
     ));
     // muvm uses the host runtime directory to discover the audio socket.
     // Preserve that discovery when moving its lock and server sockets.
@@ -191,6 +286,7 @@ pub fn plan(
         environment.extend([
             "LIBGL_ALWAYS_SOFTWARE=1",
             "GALLIUM_DRIVER=llvmpipe",
+            "MESA_LOADER_DRIVER_OVERRIDE=swrast",
             "LIBGL_DRI3_DISABLE=1",
         ]);
     }
@@ -199,6 +295,22 @@ pub fn plan(
         .flat_map(|value| ["-e".to_string(), value.to_string()])
         .collect::<Vec<_>>();
     command.args.splice(0..0, args);
+    if let Some(directory) = assets {
+        // Both ELF loaders resolve the same basename: native ARM code from
+        // this directory, x86 code from the compatibility overlay's /usr/lib64.
+        // This also covers FEX re-execution for application subprocesses.
+        let mut libraries = directory.join("native").to_string_lossy().into_owned();
+        if let Ok(existing) = std::env::var("LD_LIBRARY_PATH") {
+            if !existing.is_empty() {
+                libraries.push(':');
+                libraries.push_str(&existing);
+            }
+        }
+        command.args.splice(0..0, [
+            "-e".into(), "LD_PRELOAD=dnf-binfmt-mmap.so".into(),
+            "-e".into(), format!("LD_LIBRARY_PATH={libraries}"),
+        ]);
+    }
     if !bus {
         // Prevent an inherited host UNIX bus path from being used accidentally.
         command
@@ -223,6 +335,18 @@ pub fn plan(
 mod tests {
     use super::*;
     #[test]
+    fn video_bridge_reuses_only_the_expected_host_process() {
+        let root = std::env::temp_dir().join(format!("dnf-binfmt-video-proc-{}", std::process::id()));
+        fs::create_dir_all(root.join("123")).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/other", root.join("123/exe")).unwrap();
+        assert!(!video_bridge_running(&root));
+        fs::remove_file(root.join("123/exe")).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/xwaylandvideobridge", root.join("123/exe")).unwrap();
+        assert!(video_bridge_running(&root));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn vm_reuse_is_scoped_to_generation_and_overlay_order() {
         let mut profile = Profile {
             directory: "/var/lib/dnf-binfmt/default".into(),
@@ -231,15 +355,16 @@ mod tests {
         };
         let base = Path::new("/run/user/1000");
         let image = Path::new("/var/lib/dnf-binfmt/default/generations/one/rootfs.erofs");
-        let first = vm_directory(base, &profile, image);
+        let first = vm_directory(base, &profile, image, false);
         assert_ne!(first, base.to_path_buf());
-        assert_eq!(first, vm_directory(base, &profile, image));
-        assert_ne!(first, vm_directory(base, &profile, Path::new("/var/lib/dnf-binfmt/default/generations/two/rootfs.erofs")));
+        assert_ne!(first, vm_directory(base, &profile, image, true));
+        assert_eq!(first, vm_directory(base, &profile, image, false));
+        assert_ne!(first, vm_directory(base, &profile, Path::new("/var/lib/dnf-binfmt/default/generations/two/rootfs.erofs"), false));
         profile.overlays = vec!["/one.erofs".into(), "/two.erofs".into()];
-        let overlays = vm_directory(base, &profile, image);
+        let overlays = vm_directory(base, &profile, image, false);
         assert_ne!(first, overlays);
         profile.overlays.reverse();
-        assert_ne!(overlays, vm_directory(base, &profile, image));
+        assert_ne!(overlays, vm_directory(base, &profile, image, false));
     }
 
     #[test]
@@ -277,7 +402,12 @@ mod tests {
         .unwrap();
         assert_eq!(command.program, "/usr/bin/python3");
         assert!(command.args.contains(&"LIBGL_ALWAYS_SOFTWARE=1".into()));
+        assert!(command.args.contains(&"--gpu-mode=software".into()));
+        assert!(command.args.contains(&"LD_PRELOAD=dnf-binfmt-mmap.so".into()));
+        assert!(command.args.iter().any(|arg| arg.ends_with("build/runtime/rootfs.erofs")));
+        let software_runtime = command.env.clone();
         assert!(command.args.contains(&"LIBGL_DRI3_DISABLE=1".into()));
+        assert!(command.args.contains(&"MESA_LOADER_DRIVER_OVERRIDE=swrast".into()));
         assert!(command.env.iter().any(|(key, value)| key == "XDG_RUNTIME_DIR" && value.contains("/dnf-binfmt/")));
         options.graphics = "accelerated".into();
         options.session_bus = "off".into();
@@ -291,6 +421,8 @@ mod tests {
         assert_eq!(command.program, "/usr/bin/muvm");
         assert!(command.env.iter().any(|(key, value)| key == "XDG_RUNTIME_DIR" && value.contains("/dnf-binfmt/")));
         assert!(!command.args.contains(&"LIBGL_ALWAYS_SOFTWARE=1".into()));
+        assert!(!command.args.contains(&"--gpu-mode=software".into()));
+        assert_ne!(software_runtime, command.env);
         assert!(command.args.contains(&"DBUS_SESSION_BUS_ADDRESS=".into()));
     }
 
