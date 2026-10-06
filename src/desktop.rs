@@ -30,7 +30,7 @@ pub fn exec_quote(value: &str) -> String {
 
 pub fn rewrite(content: &str, backend: &Path, state: &Path, profile: &str) -> Option<String> {
     let prefix = format!(
-        "{} --state-dir {} --profile {} run -- ",
+        "{} run --state-dir {} --profile {} -- ",
         exec_quote(&backend.to_string_lossy()),
         exec_quote(&state.to_string_lossy()),
         exec_quote(profile)
@@ -186,6 +186,72 @@ pub fn export_after_transaction(options: &Options) -> Result<()> {
     Ok(())
 }
 
+// Copy only referenced package icons; keep host themes and other profiles untouched.
+fn package_icon(root: &Path, value: &str) -> Option<PathBuf> {
+    let root = fs::canonicalize(root).ok()?;
+    let supported = |path: &Path| path.extension().is_some_and(|ext| matches!(ext.to_str(), Some("png" | "svg" | "xpm")));
+    let confined = |path: PathBuf| fs::canonicalize(path).ok()
+        .filter(|path| path.starts_with(&root) && path.is_file() && supported(path));
+    if value.starts_with('/') {
+        return confined(root.join(value.trim_start_matches('/')));
+    }
+    if value.is_empty() || value.contains('/') || value.contains('\\') {
+        return None;
+    }
+    fn collect(directory: &Path, value: &str, depth: usize, matches: &mut Vec<PathBuf>) {
+        if depth > 8 { return; }
+        let Ok(entries) = fs::read_dir(directory) else { return; };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                collect(&path, value, depth + 1, matches);
+            } else if path.file_name().is_some_and(|name| name == value)
+                || path.file_stem().is_some_and(|name| name == value) {
+                matches.push(path);
+            }
+        }
+    }
+    let mut matches = vec![];
+    collect(&root.join("usr/share/icons"), value, 0, &mut matches);
+    collect(&root.join("usr/share/pixmaps"), value, 0, &mut matches);
+    // Prefer scalable icons, then the largest raster size, with stable tie breaking.
+    matches.sort_by_key(|path| {
+        let size = path.components().filter_map(|component| component.as_os_str().to_str())
+            .filter_map(|component| component.split_once('x'))
+            .filter_map(|(width, _)| width.parse::<u32>().ok()).max().unwrap_or(0);
+        (std::cmp::Reverse(path.extension().is_some_and(|ext| ext == "svg")), std::cmp::Reverse(size), path.clone())
+    });
+    matches.into_iter().find_map(confined)
+}
+
+fn export_icons(content: &str, root: &Path, directory: &Path, launcher: &str,
+    dry_run: bool, wanted: &mut HashSet<String>) -> Result<String> {
+    let mut lines = Vec::new();
+    for (index, line) in content.lines().enumerate() {
+        if let Some(value) = line.strip_prefix("Icon=") {
+            if let Some(source) = package_icon(root, value) {
+                let extension = source.extension().unwrap().to_string_lossy();
+                let name = format!("{launcher}-{index}.{extension}");
+                let destination = directory.join(&name);
+                if !dry_run {
+                    fs::create_dir_all(directory)?;
+                    let temp = directory.join(format!(".{name}-{}", std::process::id()));
+                    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+                    std::io::Write::write_all(&mut file, &fs::read(source)?)?;
+                    file.sync_all()?;
+                    fs::rename(temp, &destination)?;
+                }
+                wanted.insert(name);
+                let path = destination.to_string_lossy().replace('\\', "\\\\");
+                lines.push(format!("Icon={path}"));
+                continue;
+            }
+        }
+        lines.push(line.to_owned());
+    }
+    Ok(format!("{}\n", lines.join("\n")))
+}
+
 pub fn export(options: &Options, profile: &Profile) -> Result<()> {
     let current = profile.current()?;
     let source = current.join("root/usr/share/applications");
@@ -199,6 +265,8 @@ pub fn export(options: &Options, profile: &Profile) -> Result<()> {
     let prefix = format!("dnf-binfmt-{}.", options.profile);
     let backend = std::env::current_exe()?;
     let mut wanted = HashSet::new();
+    let icons = data.join("dnf-binfmt").join(&options.profile).join("icons");
+    let mut wanted_icons = HashSet::new();
     if !options.dry_run {
         fs::create_dir_all(&target)?;
     }
@@ -221,6 +289,7 @@ pub fn export(options: &Options, profile: &Profile) -> Result<()> {
             if let Some(output) = rewrite(&content, &backend, &options.state_dir, &options.profile)
             {
                 let name = format!("{prefix}{name}");
+                let output = export_icons(&output, &current.join("root"), &icons, &name, options.dry_run, &mut wanted_icons)?;
                 println!("Export {}", target.join(&name).display());
                 if !options.dry_run {
                     // Rename a freshly created regular file instead of following an old symlink.
@@ -249,13 +318,48 @@ pub fn export(options: &Options, profile: &Profile) -> Result<()> {
             }
         }
     }
-    println!("Menu entries refreshed. Some package icons and working directories need manual integration in this prototype.");
+    if icons.is_dir() {
+        for entry in fs::read_dir(&icons)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&prefix) && !wanted_icons.contains(&name) && !options.dry_run {
+                fs::remove_file(entry.path())?;
+            }
+        }
+    }
+    println!("Menu entries and package icons refreshed.");
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_icons_are_copied_and_guest_paths_cannot_escape() {
+        let directory = std::env::temp_dir().join(format!("dnf-binfmt-icons-{}", std::process::id()));
+        let root = directory.join("root");
+        let small = root.join("usr/share/icons/hicolor/16x16/apps");
+        let large = root.join("usr/share/icons/hicolor/256x256/apps");
+        fs::create_dir_all(&small).unwrap();
+        fs::create_dir_all(&large).unwrap();
+        fs::write(small.join("discord.png"), b"small").unwrap();
+        fs::write(large.join("discord.png"), b"large").unwrap();
+        fs::write(directory.join("outside.png"), b"outside").unwrap();
+        std::os::unix::fs::symlink(directory.join("outside.png"), large.join("escape.png")).unwrap();
+        assert_eq!(package_icon(&root, "discord"), Some(large.join("discord.png")));
+        assert!(package_icon(&root, "escape").is_none());
+        assert!(package_icon(&root, "/../outside.png").is_none());
+        assert!(package_icon(&root, "../outside").is_none());
+        let icons = directory.join("exported");
+        let mut wanted = HashSet::new();
+        let output = export_icons("[Desktop Entry]\nIcon=discord\n[Desktop Action New]\nIcon=/usr/share/icons/hicolor/16x16/apps/discord.png\n", &root, &icons, "dnf-binfmt-default.discord.desktop", false, &mut wanted).unwrap();
+        assert!(output.contains(&format!("Icon={}/dnf-binfmt-default.discord.desktop-1.png", icons.display())));
+        assert_eq!(fs::read(icons.join("dnf-binfmt-default.discord.desktop-1.png")).unwrap(), b"large");
+        assert_eq!(fs::read(icons.join("dnf-binfmt-default.discord.desktop-3.png")).unwrap(), b"small");
+        assert_eq!(wanted.len(), 2);
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn desktop_entries_identify_gui_shell_launchers_without_matching_other_apps() {
@@ -295,8 +399,8 @@ mod tests {
             "default",
         )
         .unwrap();
-        assert!(output.contains("run -- /usr/bin/app %U"));
-        assert!(output.contains("run -- /usr/bin/app --new %f"));
+        assert!(output.contains("--profile \"default\" -- /usr/bin/app %U"));
+        assert!(output.contains("--profile \"default\" -- /usr/bin/app --new %f"));
         assert!(!output.contains("TryExec="));
         assert!(!output.contains("DBusActivatable=true"));
         assert_eq!(output.matches("DBusActivatable=false").count(), 1);

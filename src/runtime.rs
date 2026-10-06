@@ -223,6 +223,21 @@ fn compatibility_assets() -> Result<PathBuf> {
     Err("FEX compatibility helper is missing; run make and sudo make install".into())
 }
 
+fn application_arguments(arguments: &[String]) -> Vec<String> {
+    let mut result = arguments.to_vec();
+    if arguments.first().is_some_and(|argument| matches!(argument.as_str(), "discord" | "/usr/bin/discord")) {
+        // Chromium's 15-second child IPC deadline can expire while FEX is
+        // still initializing Discord. Keep its network service alive through
+        // the slow startup; preserve any explicit caller override.
+        let switches = arguments.iter().skip(1).take_while(|argument| argument.as_str() != "--");
+        if !switches.clone().any(|argument| argument == "--ipc-connection-timeout"
+            || argument.starts_with("--ipc-connection-timeout=")) {
+            result.insert(1, "--ipc-connection-timeout=180".into());
+        }
+    }
+    result
+}
+
 pub fn plan(
     profile: &Profile,
     image: &Path,
@@ -251,7 +266,7 @@ pub fn plan(
             .chain(assets.iter().map(|directory| directory.join("rootfs.erofs")))
             .collect(),
     };
-    let mut command = launch_command(&runtime_profile, image, &options.args);
+    let mut command = launch_command(&runtime_profile, image, &application_arguments(&options.args));
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         command.args.insert(0, "-t".into());
     }
@@ -382,6 +397,18 @@ mod tests {
         assert!(private_directory(&directory).is_err());
         fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn discord_ipc_deadline_preserves_overrides_and_url_arguments() {
+        let args = ["/usr/bin/discord", "--url", "--", "discord://channel"]
+            .map(str::to_owned).to_vec();
+        assert_eq!(application_arguments(&args), ["/usr/bin/discord", "--ipc-connection-timeout=180", "--url", "--", "discord://channel"]);
+        for args in [vec!["discord", "--ipc-connection-timeout=90"],
+            vec!["discord", "--ipc-connection-timeout", "90"], vec!["/usr/bin/other", "--url"]] {
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert_eq!(application_arguments(&args), args);
+        }
+    }
+
     #[test]
     fn global_gui_policy_enables_software_rendering_and_filtered_bridge() {
         let profile = Profile {

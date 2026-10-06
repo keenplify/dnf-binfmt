@@ -43,12 +43,12 @@ work. Per-user application settings can use the user's home directory.
 ## Build and install
 
 Requirements: Fedora's Rust/Cargo (Rust 1.89+), C++20 compiler, Make,
-`dnf5-devel`, `libdnf5-devel`, `libdnf5-cli-devel`, `fmt-devel`, `erofs-utils`,
+`dnf5-devel`, `libdnf5-devel`, `libdnf5-cli-devel`, `fmt-devel`, `glib2`, `erofs-utils`,
 and `binutils-x86_64-linux-gnu` on ARM (for the small guest runtime helper).
 The adapter targets DNF5 plugin API 2.0 and libdnf5-cli ABI 3.
 
 ```sh
-sudo dnf install rust cargo gcc-c++ make dnf5-devel libdnf5-devel libdnf5-cli-devel fmt-devel erofs-utils binutils-x86_64-linux-gnu
+sudo dnf install rust cargo gcc-c++ make dnf5-devel libdnf5-devel libdnf5-cli-devel fmt-devel glib2 erofs-utils binutils-x86_64-linux-gnu
 make
 make test
 sudo make install
@@ -89,8 +89,10 @@ Export discovers normal
 `.desktop` files in the environment's `/usr/share/applications`, rewrites
 their launch commands, preserves file/URL field codes and desktop actions,
 and removes stale launchers belonging to that profile. D-Bus activation and
-host `TryExec`/working-directory checks are disabled. Icons and requested
-working directories are not integrated yet. Automatic exports use the sudo caller's standard `~/.local/share/applications`
+host `TryExec`/working-directory checks are disabled. Referenced package icons
+are copied into the desktop user's data directory and linked from the shortcuts;
+stale exported icons are removed when packages change. Requested working
+directories are not integrated yet. Automatic exports use the sudo caller's standard `~/.local/share/applications`
 directory. For a custom `XDG_DATA_HOME`, run `dnf binfmt export` manually
 in your desktop session.
 
@@ -131,9 +133,12 @@ optional ELF plugins can pull in unnecessary libraries, and libraries loaded
 only by name through `dlopen` cannot all be discovered this way.
 GUI environments also install the provider of `libX11-xcb.so.1`, which newer
 Chromium clients load by name, and Mesa EGL/GLX and software DRI drivers.
-The common GUI runtime also includes GTK3, GBM, and PulseAudio libraries for
+The common GUI runtime also includes GTK3, its XIM input module, dconf settings
+and Canberra sound backends, GBM, and PulseAudio libraries for
 bootstrap RPMs whose actual payload is downloaded into the user's home.
 These modules cannot be discovered reliably through ELF dependencies alone.
+GSettings schemas are compiled explicitly before publishing the image, without
+running RPM scripts or triggers.
 Software mode explicitly selects `swrast` and `llvmpipe` instead of inheriting
 muvm's Asahi driver override.
 
@@ -143,7 +148,10 @@ reject its cleanup with `EOVERFLOW`; V8 traps on that failed cleanup. The helper
 discards only non-fixed hints crossing that boundary, allowing a normal high
 address. Fixed mappings keep their semantics. It does not disable application
 sandboxes. With this FEX version, Discord additionally needs explicit
-`--no-sandbox` to run its renderer:
+`--no-sandbox` to run its renderer. Discord launches automatically receive
+`--ipc-connection-timeout=180`, unless explicitly overridden: Chromium's normal
+15-second child connection deadline can expire during FEX initialization and
+leave the splash screen spinning.
 
 ```sh
 dnf binfmt run --graphics software --session-bus filtered -- /usr/bin/discord --disable-gpu --no-sandbox
@@ -275,15 +283,12 @@ downloaded before using `dnf binfmt install`.
 
 Some vendor RPMs install a bootstrapper that downloads the actual application
 into the user's home directory on first launch. Those downloaded binaries
-are outside the RPM dependency and installation-time ELF checks. For example,
-if Discord reports missing ATK/GTK libraries, install its desktop runtime
-libraries into the managed profile:
+are outside the RPM dependency and installation-time ELF checks. To support
+these applications, the installer supplies the common GTK desktop runtime automatically. For an
+older profile created before this setup was added, update the backend and run
+`sudo dnf binfmt upgrade` to apply the runtime audit and regenerate its image.
 
-```sh
-sudo dnf binfmt install gtk3 mesa-libgbm pulseaudio-libs
-```
-
-Then launch it again as your normal user. The first Discord start under FEX
+The first Discord start under FEX
 can take several minutes while its updater and renderer initialize. Installing these libraries on the
 ARM host does not supply the x86-64 libraries in the managed image.
 

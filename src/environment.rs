@@ -443,6 +443,25 @@ fn mutate(options: &Options, profile: &Profile) -> Result<u8> {
     Ok(0)
 }
 
+fn compile_settings_schemas(root: &Path) -> Result<()> {
+    let directory = root.join("usr/share/glib-2.0/schemas");
+    if !directory.exists() {
+        return Ok(());
+    }
+    // The output belongs to the staged root and must not follow a package
+    // symlink into the host filesystem. GLib's cache format is portable.
+    for component in ["usr", "usr/share", "usr/share/glib-2.0", "usr/share/glib-2.0/schemas"] {
+        if !fs::symlink_metadata(root.join(component))?.is_dir() {
+            return Err("GSettings schema directory must be a regular directory in the managed root".into());
+        }
+    }
+    let cache = directory.join("gschemas.compiled");
+    if fs::symlink_metadata(&cache).is_ok_and(|metadata| !metadata.is_file()) {
+        return Err("GSettings schema cache must be a regular file in the managed root".into());
+    }
+    CommandSpec::new("/usr/bin/glib-compile-schemas", vec![string(&directory)]).checked()
+}
+
 fn stage_generation(
     profile: &Profile,
     action: &str,
@@ -500,6 +519,10 @@ fn stage_generation(
                     // there too, instead of relying on the ARM host's GTK.
                     "libgtk-3.so.0".into(), "libgbm.so.1".into(),
                     "libpulse.so.0".into(),
+                    // GTK recommends these backends, but DNF weak deps are
+                    // disabled here. They are runtime modules, not DT_NEEDED.
+                    "libdconf.so.1".into(), "libdconfsettings.so".into(),
+                    "libcanberra-gtk3.so.0".into(), "libcanberra-gtk3-module.so".into(),
                 ]);
             }
             let missing = capabilities.missing();
@@ -512,13 +535,26 @@ fn stage_generation(
             eprintln!("Resolving {} missing ELF library providers", missing.len());
             run(dnf_command(profile, &root, "install", &missing))?;
         }
-        if inspection::tree(&root)?.gui()
-            && !root.join("usr/lib64/gbm/dri_gbm.so").exists() {
-            run(dnf_command(profile, &root, "install", &["mesa-dri-drivers.x86_64".into()]))?;
+        if inspection::tree(&root)?.gui() {
+            let mut modules = Vec::new();
+            if !root.join("usr/lib64/gbm/dri_gbm.so").exists() {
+                modules.push("mesa-dri-drivers.x86_64".into());
+            }
+            // muvm selects GTK's XIM input context for X11. Fedora splits
+            // that dynamically loaded module out of the main gtk3 package.
+            if !root.join("usr/lib64/gtk-3.0/3.0.0/immodules/im-xim.so").exists() {
+                modules.push("gtk3-immodule-xim.x86_64".into());
+            }
+            if !modules.is_empty() {
+                run(dnf_command(profile, &root, "install", &modules))?;
+            }
         }
         if !root.join("usr/bin/bash").is_file() {
             return Err("transaction left no x86-64 bash; refusing publication".into());
         }
+        // RPM triggers remain disabled. Generate the portable settings cache
+        // explicitly before sealing the immutable image.
+        compile_settings_schemas(&root)?;
         run(image_command(&root, &generation.join("rootfs.erofs")))?;
         File::open(generation.join("rootfs.erofs"))?.sync_all()?;
         let pending = profile
@@ -679,6 +715,27 @@ mod tests {
             releasever: "44".into(),
             overlays: vec![],
         }
+    }
+
+    #[test]
+    fn settings_schema_cache_is_usable_and_rejects_host_symlinks() {
+        let profile = fixture("schemas");
+        let root = profile.directory.join("generations/old/root");
+        let schemas = root.join("usr/share/glib-2.0/schemas");
+        fs::create_dir_all(&schemas).unwrap();
+        fs::write(schemas.join("org.example.binfmt.gschema.xml"),
+            "<schemalist><schema id='org.example.binfmt' path='/org/example/binfmt/'><key name='enabled' type='b'><default>true</default></key></schema></schemalist>").unwrap();
+        compile_settings_schemas(&root).unwrap();
+        let output = Command::new("/usr/bin/gsettings").args(["--schemadir", schemas.to_str().unwrap(), "get", "org.example.binfmt", "enabled"]).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "true");
+        fs::remove_file(schemas.join("gschemas.compiled")).unwrap();
+        let outside = profile.directory.join("outside");
+        fs::write(&outside, "untouched").unwrap();
+        symlink(&outside, schemas.join("gschemas.compiled")).unwrap();
+        assert!(compile_settings_schemas(&root).is_err());
+        assert_eq!(fs::read_to_string(outside).unwrap(), "untouched");
+        fs::remove_dir_all(profile.directory).unwrap();
     }
 
     #[test]

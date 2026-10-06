@@ -9,6 +9,7 @@ import argparse
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import tempfile
 
@@ -104,7 +105,11 @@ with tempfile.TemporaryDirectory(prefix="dnf-binfmt-smoke-") as temporary:
         other_profile.write_text("different profile")
         checked(dnf + ["export", f"--state-dir={state}"], environment)
         launcher = destination / "dnf-binfmt-default.example.desktop"
-        assert "run -- /usr/bin/example %U" in launcher.read_text()
+        command = shlex.split(next(line[5:] for line in launcher.read_text().splitlines() if line.startswith("Exec=")))
+        assert command[1] == "run"
+        assert command[-3:] == ["--", "/usr/bin/example", "%U"]
+        # Execute the generated argument order through the actual backend parser.
+        checked(command[:2] + ["--dry-run"] + command[2:], environment)
         assert not stale.exists() and other_profile.exists()
         validator = shutil.which("desktop-file-validate")
         if validator:

@@ -65,7 +65,18 @@ GUI transaction audit now installs those providers and the common GTK/GBM/audio
 ABI automatically. Network-service timeouts and restarts occurred during
 startup but recovered. An isolated official FEX 2609.1 test also loaded the
 Discord web UI. No newer emulator was installed on the host.
-Discord login, audio, video, and screen sharing have not been verified.
+A later repeat launch stalled on the splash screen. Verbose logs showed the
+network child terminating after its 15-second IPC connection deadline. With
+`--ipc-connection-timeout=180`, the installed package root reached
+`renderer-full-interactive` after about 199 seconds and connected to Discord's
+gateway. The launcher now supplies that timeout for `/usr/bin/discord` and
+`discord`, while preserving caller overrides. Disabling the session bridge
+and testing portable FEX 2609.1 did not remove the original timeout. Discord
+rewrites its Chromium feature switches, so the in-process network feature
+experiment did not take effect. The GUI dependency audit now also installs
+Fedora's separate `gtk3-immodule-xim` package.
+Existing-session login resumed during this test. Audio reported a missing ALSA
+PipeWire module; audio, video, and screen sharing remain unverified.
 
 Not yet verified:
 
